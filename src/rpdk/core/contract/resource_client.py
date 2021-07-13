@@ -12,6 +12,7 @@ from botocore import UNSIGNED
 from botocore.config import Config
 
 from rpdk.core.contract.interface import Action, HandlerErrorCode, OperationStatus
+from rpdk.core.contract.type_configuration import TypeConfiguration
 from rpdk.core.exceptions import InvalidProjectError
 
 from ..boto_helpers import (
@@ -130,12 +131,18 @@ class ResourceClient:  # pylint: disable=too-many-instance-attributes
         inputs=None,
         role_arn=None,
         timeout_in_seconds="30",
+        type_name=None,
+        log_group_name=None,
+        log_role_arn=None,
         docker_image=None,
         executable_entrypoint=None,
     ):  # pylint: disable=too-many-arguments
         self._schema = schema
         self._session = create_sdk_session(region)
         self._role_arn = role_arn
+        self._type_name = type_name
+        self._log_group_name = log_group_name
+        self._log_role_arn = log_role_arn
         self.region = region
         self.account = get_account(
             self._session,
@@ -349,16 +356,19 @@ class ResourceClient:  # pylint: disable=too-many-instance-attributes
             " defined as writeOnlyProperties in the resource schema"
         )
         try:
-            for key in inputs:
-                if isinstance(inputs[key], dict):
-                    self.compare(inputs[key], outputs[key])
-                elif isinstance(inputs[key], list):
-                    assert len(inputs[key]) == len(outputs[key])
-                    self.compare_list(inputs[key], outputs[key])
-                else:
-                    assert inputs[key] == outputs[key], assertion_error_message
-        except KeyError as e:
-            raise AssertionError(assertion_error_message) from e
+            if isinstance(inputs, dict):
+                for key in inputs:
+                    if isinstance(inputs[key], dict):
+                        self.compare(inputs[key], outputs[key])
+                    elif isinstance(inputs[key], list):
+                        assert len(inputs[key]) == len(outputs[key])
+                        self.compare_list(inputs[key], outputs[key])
+                    else:
+                        assert inputs[key] == outputs[key], assertion_error_message
+            else:
+                assert inputs == outputs, assertion_error_message
+        except Exception as exception:
+            raise AssertionError(assertion_error_message) from exception
 
     def compare_list(self, inputs, outputs):
         for index in range(len(inputs)):  # pylint: disable=C0200
@@ -419,24 +429,34 @@ class ResourceClient:  # pylint: disable=too-many-instance-attributes
         account,
         action,
         creds,
+        type_name,
+        log_group_name,
+        log_creds,
         token,
         callback_context=None,
-        **kwargs
+        type_configuration=None,
+        **kwargs,
     ):
-        return {
+        request_body = {
             "requestData": {
                 "callerCredentials": creds,
                 "resourceProperties": desired_resource_state,
                 "previousResourceProperties": previous_resource_state,
                 "logicalResourceId": token,
+                "typeConfiguration": type_configuration,
             },
             "region": region,
             "awsAccountId": account,
             "action": action,
             "callbackContext": callback_context,
             "bearerToken": token,
+            "resourceType": type_name,
             **kwargs,
         }
+        if log_group_name and log_creds:
+            request_body["requestData"]["providerCredentials"] = log_creds
+            request_body["requestData"]["providerLogGroupName"] = log_group_name
+        return request_body
 
     @staticmethod
     def generate_token():
@@ -486,7 +506,14 @@ class ResourceClient:  # pylint: disable=too-many-instance-attributes
                      match the primaryIdentifier passed into the request"
             ) from e
 
-    def _make_payload(self, action, current_model, previous_model=None, **kwargs):
+    def _make_payload(
+        self,
+        action,
+        current_model,
+        previous_model=None,
+        type_configuration=None,
+        **kwargs,
+    ):
         return self.make_request(
             current_model,
             previous_model,
@@ -496,8 +523,14 @@ class ResourceClient:  # pylint: disable=too-many-instance-attributes
             get_temporary_credentials(
                 self._session, LOWER_CAMEL_CRED_KEYS, self._role_arn
             ),
+            self._type_name,
+            self._log_group_name,
+            get_temporary_credentials(
+                self._session, LOWER_CAMEL_CRED_KEYS, self._log_role_arn
+            ),
             self.generate_token(),
-            **kwargs
+            type_configuration=type_configuration,
+            **kwargs,
         )
 
     def _call(self, payload):
@@ -565,6 +598,8 @@ class ResourceClient:  # pylint: disable=too-many-instance-attributes
     def call_and_assert(
         self, action, assert_status, current_model, previous_model=None, **kwargs
     ):
+        if not self.has_required_handlers():
+            raise ValueError("Create/Read/Delete handlers are required")
         if assert_status not in [OperationStatus.SUCCESS, OperationStatus.FAILED]:
             raise ValueError("Assert status {} not supported.".format(assert_status))
 
@@ -577,7 +612,13 @@ class ResourceClient:  # pylint: disable=too-many-instance-attributes
         return status, response, error_code
 
     def call(self, action, current_model, previous_model=None, **kwargs):
-        request = self._make_payload(action, current_model, previous_model, **kwargs)
+        request = self._make_payload(
+            action,
+            current_model,
+            previous_model,
+            TypeConfiguration.get_type_configuration(),
+            **kwargs,
+        )
         start_time = time.time()
         response = self._call(request)
         self.assert_time(start_time, time.time(), action)
@@ -610,3 +651,12 @@ class ResourceClient:  # pylint: disable=too-many-instance-attributes
 
     def has_update_handler(self):
         return "update" in self._schema["handlers"]
+
+    def has_required_handlers(self):
+        try:
+            has_delete = "delete" in self._schema["handlers"]
+            has_create = "create" in self._schema["handlers"]
+            has_read = "read" in self._schema["handlers"]
+            return has_read and has_create and has_delete
+        except KeyError:
+            return False

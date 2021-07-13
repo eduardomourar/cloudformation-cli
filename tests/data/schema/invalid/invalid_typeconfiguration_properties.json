@@ -3,7 +3,7 @@
     "description": "a test schema",
     "properties": {
         "property1": {
-            "type": "array"
+            "type": "string"
         }
     },
     "primaryIdentifier": [
@@ -13,5 +13,12 @@
         "/properties/property1"
     ],
     "additionalProperties": false,
-    "taggable": false
+    "typeConfiguration": {
+        "properties": {
+            "CloudFormationTest": {
+                "type": "string"
+            }
+        },
+        "additionalProperties": false
+    }
 }
